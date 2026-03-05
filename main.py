@@ -244,3 +244,7 @@ def get_invoice(invoice_id: int):
         "invoice": dict(invoice),
         "items": [dict(item) for item in items]
     }
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
