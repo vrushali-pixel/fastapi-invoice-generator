@@ -22,6 +22,8 @@ from service import (
     ProductNotFoundError,
     InsufficientStockError,
 )
+from auth_router import router as auth_router
+from jwt_dependency import get_current_user
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas as pdf_canvas
@@ -47,6 +49,14 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# ─────────────────────────────────────────────
+# CONCEPT: include_router
+# Registers all /auth/* endpoints from auth_router.py
+# into the main app. Clean separation — auth logic
+# lives in its own file, main.py just mounts it.
+# ─────────────────────────────────────────────
+app.include_router(auth_router)
 
 PDF_FOLDER = "pdfs"
 os.makedirs(PDF_FOLDER, exist_ok=True)

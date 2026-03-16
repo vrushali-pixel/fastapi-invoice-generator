@@ -4,8 +4,22 @@ def init_db():
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Enable WAL mode for better concurrency
     cursor.execute("PRAGMA journal_mode=WAL;")
+
+    # ─────────────────────────────────────────
+    # CONCEPT: users table
+    # password_hash stores the bcrypt hash — NEVER plain text
+    # created_at is automatic — the DB sets it
+    # ─────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        full_name TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS products (
