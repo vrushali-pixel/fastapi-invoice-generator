@@ -1,6 +1,18 @@
-venv/
+# Environment variables — never commit these
+.env
+
+# Database file — regenerates on startup
+invoice.db
+
+# Generated PDFs — not source code
+pdfs/
+
+# Python cache
 __pycache__/
 *.pyc
-*.db
-.env
-pdfs/
+*.pyo
+.pytest_cache/
+
+# Virtual environment
+venv/
+.venv/
