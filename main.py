@@ -24,6 +24,7 @@ from service import (
 )
 from auth_router import router as auth_router
 from jwt_dependency import get_current_user
+from tasks import generate_pdf_task
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas as pdf_canvas
@@ -231,40 +232,53 @@ def invoice_stats():
 
 @app.post("/invoices/{invoice_id}/pdf", dependencies=[Depends(verify_api_key)])
 def generate_invoice_pdf(invoice_id: int, template: str = "standard"):
+    # ─────────────────────────────────────────
+    # CONCEPT: .delay() sends task to Redis queue
+    # Instead of generating PDF here (slow, blocks API),
+    # we send a message to Redis: "generate PDF for invoice X"
+    # Celery worker picks it up and runs it in background.
+    # API returns IMMEDIATELY with a task_id.
+    # Client can poll /tasks/{task_id} to check status.
+    # ─────────────────────────────────────────
     conn = get_connection()
     cursor = conn.cursor()
     try:
         invoice = get_invoice_by_id(cursor, invoice_id)
         if not invoice:
             raise HTTPException(status_code=404, detail="Invoice not found")
-
-        items = get_invoice_items(cursor, invoice_id)
-        file_path = os.path.join(PDF_FOLDER, f"{invoice['invoice_number']}.pdf")
-
-        # CONCEPT: Strategy pattern (simple version)
-        # We pick a function based on the template param.
-        # Each function draws a different PDF layout.
-        # Adding a new template = adding one function, zero
-        # changes to the endpoint logic.
-        if template == "minimal":
-            _generate_minimal_pdf(file_path, invoice, items)
-        elif template == "detailed":
-            _generate_detailed_pdf(file_path, invoice, items)
-        else:
-            _generate_standard_pdf(file_path, invoice, items)
-
-        cursor.execute(
-            "UPDATE invoices SET pdf_path = ? WHERE id = %s",
-            (file_path, invoice_id),
-        )
-        conn.commit()
-        return {
-            "message": "PDF generated successfully",
-            "template_used": template,
-            "file": file_path,
-        }
     finally:
         conn.close()
+
+    task = generate_pdf_task.delay(invoice_id, template)
+
+    return {
+        "message": "PDF generation started",
+        "task_id": task.id,
+        "status_url": f"/tasks/{task.id}",
+        "template": template,
+    }
+
+
+@app.get("/tasks/{task_id}", dependencies=[Depends(verify_api_key)])
+def get_task_status(task_id: str):
+    # ─────────────────────────────────────────
+    # CONCEPT: AsyncResult
+    # We use the task_id to check what happened
+    # to the task in Redis.
+    # States: PENDING → STARTED → SUCCESS/FAILURE
+    # ─────────────────────────────────────────
+    result = generate_pdf_task.AsyncResult(task_id)
+
+    if result.state == "PENDING":
+        return {"task_id": task_id, "status": "pending"}
+    elif result.state == "STARTED":
+        return {"task_id": task_id, "status": "processing"}
+    elif result.state == "SUCCESS":
+        return {"task_id": task_id, "status": "completed", "result": result.result}
+    elif result.state == "FAILURE":
+        return {"task_id": task_id, "status": "failed", "error": str(result.result)}
+    else:
+        return {"task_id": task_id, "status": result.state}
 
 
 @app.get("/invoices/{invoice_id}/pdf/download", dependencies=[Depends(verify_api_key)])
