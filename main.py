@@ -102,7 +102,7 @@ def create_product(product: ProductCreate):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO products (name, current_price, stock_quantity) VALUES (?, ?, ?)",
+        "INSERT INTO products (name, current_price, stock_quantity) VALUES (%s, %s, %s)",
         (product.name, product.current_price, product.stock_quantity),
     )
     conn.commit()
@@ -202,7 +202,7 @@ def invoice_stats():
         revenue = cursor.fetchone()["revenue"]
 
         cursor.execute(
-            "SELECT COUNT(*) as today FROM invoices WHERE DATE(created_at) = DATE('now')"
+            "SELECT COUNT(*) as today FROM invoices WHERE created_at::date = CURRENT_DATE"
         )
         today = cursor.fetchone()["today"]
 
@@ -254,7 +254,7 @@ def generate_invoice_pdf(invoice_id: int, template: str = "standard"):
             _generate_standard_pdf(file_path, invoice, items)
 
         cursor.execute(
-            "UPDATE invoices SET pdf_path = ? WHERE id = ?",
+            "UPDATE invoices SET pdf_path = ? WHERE id = %s",
             (file_path, invoice_id),
         )
         conn.commit()

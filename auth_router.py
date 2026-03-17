@@ -54,13 +54,13 @@ def register(data: RegisterRequest):
 
     try:
         # Check duplicate email
-        cursor.execute("SELECT id FROM users WHERE email = ?", (data.email,))
+        cursor.execute("SELECT id FROM users WHERE email = %s", (data.email,))
         if cursor.fetchone():
             raise HTTPException(status_code=400, detail="Email already registered")
 
         hashed = hash_password(data.password)
         cursor.execute(
-            "INSERT INTO users (email, password_hash, full_name) VALUES (?, ?, ?)",
+            "INSERT INTO users (email, password_hash, full_name) VALUES (%s, %s, %s)",
             (data.email, hashed, data.full_name),
         )
         conn.commit()
