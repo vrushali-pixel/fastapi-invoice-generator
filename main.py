@@ -1,10 +1,14 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from typing import List
 from datetime import datetime
 import os
+
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from init_db import init_db
 from database import get_connection
@@ -29,13 +33,14 @@ from tasks import generate_pdf_task
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas as pdf_canvas
 
+# CONCEPT: Rate Limiting with slowapi
+# Limiter tracks requests per IP address.
+# @limiter.limit("10/minute") means that IP
+# can only call it 10 times per minute.
+# On the 11th call -> 429 Too Many Requests.
+limiter = Limiter(key_func=get_remote_address)
 
-# ─────────────────────────────────────────────
-# CONCEPT: Lifespan
-# FastAPI lifespan runs setup code ONCE when the
-# app starts, and teardown code when it stops.
-# Better than @app.on_event which is deprecated.
-# ─────────────────────────────────────────────
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -51,31 +56,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ─────────────────────────────────────────────
-# CONCEPT: include_router
-# Registers all /auth/* endpoints from auth_router.py
-# into the main app. Clean separation — auth logic
-# lives in its own file, main.py just mounts it.
-# ─────────────────────────────────────────────
+# Attach limiter to app
+# add_exception_handler returns clean 429 response automatically
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.include_router(auth_router)
 
 PDF_FOLDER = "pdfs"
 os.makedirs(PDF_FOLDER, exist_ok=True)
 
 
-# ─────────────────────────────────────────────
-# PUBLIC ENDPOINTS (no auth required)
-# ─────────────────────────────────────────────
-
 @app.get("/")
 def root():
     return {"message": "Invoice Generator API is running."}
 
 
-# CONCEPT: Health check
-# Every production API has /health.
-# Load balancers and deployment platforms (Railway,
-# Render, Docker) ping this to know if the app is alive.
 @app.get("/health")
 def health_check():
     try:
@@ -88,18 +83,9 @@ def health_check():
         raise HTTPException(status_code=500, detail="Database connection failed")
 
 
-# ─────────────────────────────────────────────
-# PRODUCT ENDPOINTS
-# CONCEPT: Depends(verify_api_key)
-# FastAPI's dependency injection system.
-# Adding this to an endpoint means FastAPI will
-# call verify_api_key() BEFORE running the endpoint.
-# If the key is wrong, it raises 401 and the
-# endpoint never executes. Clean separation of concerns.
-# ─────────────────────────────────────────────
-
 @app.post("/products", dependencies=[Depends(verify_api_key)])
-def create_product(product: ProductCreate):
+@limiter.limit("30/minute")
+def create_product(request: Request, product: ProductCreate):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
@@ -112,7 +98,8 @@ def create_product(product: ProductCreate):
 
 
 @app.get("/products", dependencies=[Depends(verify_api_key)])
-def get_products():
+@limiter.limit("60/minute")
+def get_products(request: Request):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM products")
@@ -121,12 +108,9 @@ def get_products():
     return [dict(row) for row in rows]
 
 
-# ─────────────────────────────────────────────
-# INVOICE ENDPOINTS
-# ─────────────────────────────────────────────
-
 @app.post("/invoices", dependencies=[Depends(verify_api_key)])
-def create_invoice(invoice: InvoiceCreate):
+@limiter.limit("20/minute")
+def create_invoice(request: Request, invoice: InvoiceCreate):
     conn = get_connection()
     cursor = conn.cursor()
     try:
@@ -153,7 +137,8 @@ def create_invoice(invoice: InvoiceCreate):
 
 
 @app.get("/invoices", dependencies=[Depends(verify_api_key)])
-def get_all_invoices():
+@limiter.limit("60/minute")
+def get_all_invoices(request: Request):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM invoices ORDER BY created_at DESC")
@@ -162,12 +147,33 @@ def get_all_invoices():
     return [dict(row) for row in rows]
 
 
-# CONCEPT: Path parameters
-# {invoice_id} in the path becomes a typed Python int.
-# FastAPI validates it automatically — sending "abc"
-# returns a 422 Unprocessable Entity, not a 500 crash.
+@app.get("/invoices/stats/summary", dependencies=[Depends(verify_api_key)])
+@limiter.limit("30/minute")
+def invoice_stats(request: Request):
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT COUNT(*) as total FROM invoices")
+        total = cursor.fetchone()["total"]
+        cursor.execute("SELECT COALESCE(SUM(total), 0) as revenue FROM invoices")
+        revenue = cursor.fetchone()["revenue"]
+        cursor.execute("SELECT COUNT(*) as today FROM invoices WHERE created_at::date = CURRENT_DATE")
+        today = cursor.fetchone()["today"]
+        cursor.execute("SELECT COUNT(*) as total_products FROM products")
+        total_products = cursor.fetchone()["total_products"]
+        return {
+            "total_invoices": total,
+            "total_revenue": round(revenue, 2),
+            "invoices_today": today,
+            "total_products": total_products,
+        }
+    finally:
+        conn.close()
+
+
 @app.get("/invoices/{invoice_id}", dependencies=[Depends(verify_api_key)])
-def get_invoice(invoice_id: int):
+@limiter.limit("60/minute")
+def get_invoice(request: Request, invoice_id: int):
     conn = get_connection()
     cursor = conn.cursor()
     try:
@@ -183,63 +189,9 @@ def get_invoice(invoice_id: int):
         conn.close()
 
 
-# ─────────────────────────────────────────────
-# STATS ENDPOINT
-# CONCEPT: Aggregate queries
-# Instead of fetching all rows and counting in Python,
-# we let the database do the work with COUNT() and SUM().
-# This is orders of magnitude faster at scale.
-# ─────────────────────────────────────────────
-
-@app.get("/invoices/stats/summary", dependencies=[Depends(verify_api_key)])
-def invoice_stats():
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT COUNT(*) as total FROM invoices")
-        total = cursor.fetchone()["total"]
-
-        cursor.execute("SELECT COALESCE(SUM(total), 0) as revenue FROM invoices")
-        revenue = cursor.fetchone()["revenue"]
-
-        cursor.execute(
-            "SELECT COUNT(*) as today FROM invoices WHERE created_at::date = CURRENT_DATE"
-        )
-        today = cursor.fetchone()["today"]
-
-        cursor.execute(
-            "SELECT COUNT(*) as total_products FROM products"
-        )
-        total_products = cursor.fetchone()["total_products"]
-
-        return {
-            "total_invoices": total,
-            "total_revenue": round(revenue, 2),
-            "invoices_today": today,
-            "total_products": total_products,
-        }
-    finally:
-        conn.close()
-
-
-# ─────────────────────────────────────────────
-# PDF ENDPOINTS
-# CONCEPT: query parameters
-# ?template=minimal is a query param — optional,
-# with a default value. FastAPI reads it from the
-# URL automatically, no parsing needed.
-# ─────────────────────────────────────────────
-
 @app.post("/invoices/{invoice_id}/pdf", dependencies=[Depends(verify_api_key)])
-def generate_invoice_pdf(invoice_id: int, template: str = "standard"):
-    # ─────────────────────────────────────────
-    # CONCEPT: .delay() sends task to Redis queue
-    # Instead of generating PDF here (slow, blocks API),
-    # we send a message to Redis: "generate PDF for invoice X"
-    # Celery worker picks it up and runs it in background.
-    # API returns IMMEDIATELY with a task_id.
-    # Client can poll /tasks/{task_id} to check status.
-    # ─────────────────────────────────────────
+@limiter.limit("10/minute")
+def generate_invoice_pdf(request: Request, invoice_id: int, template: str = "standard"):
     conn = get_connection()
     cursor = conn.cursor()
     try:
@@ -260,15 +212,9 @@ def generate_invoice_pdf(invoice_id: int, template: str = "standard"):
 
 
 @app.get("/tasks/{task_id}", dependencies=[Depends(verify_api_key)])
-def get_task_status(task_id: str):
-    # ─────────────────────────────────────────
-    # CONCEPT: AsyncResult
-    # We use the task_id to check what happened
-    # to the task in Redis.
-    # States: PENDING → STARTED → SUCCESS/FAILURE
-    # ─────────────────────────────────────────
+@limiter.limit("60/minute")
+def get_task_status(request: Request, task_id: str):
     result = generate_pdf_task.AsyncResult(task_id)
-
     if result.state == "PENDING":
         return {"task_id": task_id, "status": "pending"}
     elif result.state == "STARTED":
@@ -282,7 +228,8 @@ def get_task_status(task_id: str):
 
 
 @app.get("/invoices/{invoice_id}/pdf/download", dependencies=[Depends(verify_api_key)])
-def download_invoice_pdf(invoice_id: int):
+@limiter.limit("20/minute")
+def download_invoice_pdf(request: Request, invoice_id: int):
     conn = get_connection()
     cursor = conn.cursor()
     try:
@@ -290,7 +237,10 @@ def download_invoice_pdf(invoice_id: int):
         if not invoice:
             raise HTTPException(status_code=404, detail="Invoice not found")
         if not invoice["pdf_path"] or not os.path.exists(invoice["pdf_path"]):
-            raise HTTPException(status_code=404, detail="PDF not generated yet. POST to /invoices/{id}/pdf first.")
+            raise HTTPException(
+                status_code=404,
+                detail="PDF not generated yet. POST to /invoices/{id}/pdf first."
+            )
         return FileResponse(
             invoice["pdf_path"],
             media_type="application/pdf",
@@ -300,14 +250,7 @@ def download_invoice_pdf(invoice_id: int):
         conn.close()
 
 
-# ─────────────────────────────────────────────
-# PDF TEMPLATE FUNCTIONS
-# Private functions (prefixed with _) — internal
-# helpers, not part of the public API surface.
-# ─────────────────────────────────────────────
-
 def _draw_invoice_header(c, invoice, width, y):
-    """Shared header used by all templates."""
     c.setFont("Helvetica-Bold", 16)
     c.drawString(50, y, "INVOICE")
     c.setFont("Helvetica", 10)
@@ -318,13 +261,10 @@ def _draw_invoice_header(c, invoice, width, y):
 
 
 def _generate_standard_pdf(file_path, invoice, items):
-    """Standard template: header + items table + totals."""
     c = pdf_canvas.Canvas(file_path, pagesize=A4)
     width, height = A4
     y = height - 50
-
     y = _draw_invoice_header(c, invoice, width, y)
-
     c.setFont("Helvetica-Bold", 10)
     c.drawString(50, y, "Product")
     c.drawString(280, y, "Qty")
@@ -333,7 +273,6 @@ def _generate_standard_pdf(file_path, invoice, items):
     y -= 5
     c.line(50, y, 550, y)
     y -= 15
-
     c.setFont("Helvetica", 10)
     for item in items:
         c.drawString(50, y, str(item["name"]))
@@ -341,7 +280,6 @@ def _generate_standard_pdf(file_path, invoice, items):
         c.drawString(340, y, f"Rs. {item['unit_price']:.2f}")
         c.drawString(440, y, f"Rs. {item['line_total']:.2f}")
         y -= 18
-
     y -= 10
     c.line(50, y, 550, y)
     y -= 20
@@ -352,23 +290,18 @@ def _generate_standard_pdf(file_path, invoice, items):
     y -= 15
     c.setFont("Helvetica-Bold", 11)
     c.drawString(380, y, f"Total: Rs. {invoice['total']:.2f}")
-
     c.save()
 
 
 def _generate_minimal_pdf(file_path, invoice, items):
-    """Minimal template: clean, no table borders, compact."""
     c = pdf_canvas.Canvas(file_path, pagesize=A4)
     width, height = A4
     y = height - 50
-
     y = _draw_invoice_header(c, invoice, width, y)
-
     c.setFont("Helvetica", 10)
     for item in items:
         c.drawString(50, y, f"- {item['name']}  x{item['quantity']}  Rs. {item['line_total']:.2f}")
         y -= 16
-
     y -= 10
     c.setFont("Helvetica-Bold", 11)
     c.drawString(50, y, f"Total (incl. 18% tax): Rs. {invoice['total']:.2f}")
@@ -376,13 +309,10 @@ def _generate_minimal_pdf(file_path, invoice, items):
 
 
 def _generate_detailed_pdf(file_path, invoice, items):
-    """Detailed template: standard + per-item tax breakdown."""
     c = pdf_canvas.Canvas(file_path, pagesize=A4)
     width, height = A4
     y = height - 50
-
     y = _draw_invoice_header(c, invoice, width, y)
-
     c.setFont("Helvetica-Bold", 10)
     c.drawString(50, y, "Product")
     c.drawString(240, y, "Qty")
@@ -392,7 +322,6 @@ def _generate_detailed_pdf(file_path, invoice, items):
     y -= 5
     c.line(50, y, 560, y)
     y -= 15
-
     c.setFont("Helvetica", 9)
     for item in items:
         item_tax = round(item["line_total"] * 0.18, 2)
@@ -402,7 +331,6 @@ def _generate_detailed_pdf(file_path, invoice, items):
         c.drawString(380, y, f"Rs. {item_tax:.2f}")
         c.drawString(460, y, f"Rs. {item['line_total']:.2f}")
         y -= 18
-
     y -= 10
     c.line(50, y, 560, y)
     y -= 20
