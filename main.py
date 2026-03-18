@@ -29,24 +29,30 @@ from service import (
 from auth_router import router as auth_router
 from jwt_dependency import get_current_user
 from tasks import generate_pdf_task
+from logger import get_logger
+
+# ─────────────────────────────────────────────
+# CONCEPT: Structured JSON Logging
+# Every log line is a JSON object — searchable,
+# parseable by tools like Datadog and CloudWatch.
+# logger.info() for normal events
+# logger.error() for failures
+# extra={} adds searchable fields to the log
+# ─────────────────────────────────────────────
+logger = get_logger(__name__)
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas as pdf_canvas
 
-# CONCEPT: Rate Limiting with slowapi
-# Limiter tracks requests per IP address.
-# @limiter.limit("10/minute") means that IP
-# can only call it 10 times per minute.
-# On the 11th call -> 429 Too Many Requests.
 limiter = Limiter(key_func=get_remote_address)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    print("Database initialised.")
+    logger.info("Database initialised")
     yield
-    print("App shutting down.")
+    logger.info("App shutting down")
 
 
 app = FastAPI(
@@ -56,8 +62,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Attach limiter to app
-# add_exception_handler returns clean 429 response automatically
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.include_router(auth_router)
@@ -78,8 +82,10 @@ def health_check():
         cursor = conn.cursor()
         cursor.execute("SELECT 1")
         conn.close()
+        logger.info("Health check passed")
         return {"status": "healthy", "database": "connected"}
-    except Exception:
+    except Exception as e:
+        logger.error("Health check failed", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Database connection failed")
 
 
@@ -94,6 +100,7 @@ def create_product(request: Request, product: ProductCreate):
     )
     conn.commit()
     conn.close()
+    logger.info("Product created", extra={"name": product.name, "price": product.current_price})
     return {"message": "Product created successfully"}
 
 
@@ -116,14 +123,23 @@ def create_invoice(request: Request, invoice: InvoiceCreate):
     try:
         invoice_id, invoice_number, total = create_invoice_service(cursor, invoice)
         conn.commit()
+        logger.info("Invoice created", extra={
+            "invoice_id": invoice_id,
+            "invoice_number": invoice_number,
+            "total": total,
+            "customer": invoice.customer_name,
+        })
     except ProductNotFoundError as e:
         conn.rollback()
+        logger.error("Invoice creation failed — product not found", extra={"error": str(e)})
         raise HTTPException(status_code=404, detail=str(e))
     except InsufficientStockError as e:
         conn.rollback()
+        logger.error("Invoice creation failed — insufficient stock", extra={"error": str(e)})
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
+    except Exception as e:
         conn.rollback()
+        logger.error("Invoice creation failed — unexpected error", extra={"error": str(e)})
         raise
     finally:
         conn.close()
@@ -161,6 +177,7 @@ def invoice_stats(request: Request):
         today = cursor.fetchone()["today"]
         cursor.execute("SELECT COUNT(*) as total_products FROM products")
         total_products = cursor.fetchone()["total_products"]
+        logger.info("Stats fetched", extra={"total_invoices": total, "revenue": revenue})
         return {
             "total_invoices": total,
             "total_revenue": round(revenue, 2),
@@ -202,6 +219,7 @@ def generate_invoice_pdf(request: Request, invoice_id: int, template: str = "sta
         conn.close()
 
     task = generate_pdf_task.delay(invoice_id, template)
+    logger.info("PDF task queued", extra={"invoice_id": invoice_id, "task_id": task.id, "template": template})
 
     return {
         "message": "PDF generation started",
@@ -222,6 +240,7 @@ def get_task_status(request: Request, task_id: str):
     elif result.state == "SUCCESS":
         return {"task_id": task_id, "status": "completed", "result": result.result}
     elif result.state == "FAILURE":
+        logger.error("PDF task failed", extra={"task_id": task_id, "error": str(result.result)})
         return {"task_id": task_id, "status": "failed", "error": str(result.result)}
     else:
         return {"task_id": task_id, "status": result.state}
@@ -241,6 +260,7 @@ def download_invoice_pdf(request: Request, invoice_id: int):
                 status_code=404,
                 detail="PDF not generated yet. POST to /invoices/{id}/pdf first."
             )
+        logger.info("PDF downloaded", extra={"invoice_id": invoice_id})
         return FileResponse(
             invoice["pdf_path"],
             media_type="application/pdf",
