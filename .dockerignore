@@ -1,0 +1,32 @@
+# CONCEPT: .dockerignore
+# Same idea as .gitignore but for Docker.
+# Files listed here are NOT copied into the container.
+# This keeps the image small and fast to build.
+
+# Virtual environment — container installs its own
+venv/
+.venv/
+
+# Environment file — passed via docker-compose env_file
+.env
+
+# Database file — using PostgreSQL in Docker
+invoice.db
+
+# Generated PDFs — mounted as volume
+pdfs/
+
+# Git files
+.git/
+.gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# IDE files
+.vscode/
+.idea/

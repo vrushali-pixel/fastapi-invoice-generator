@@ -1,0 +1,89 @@
+# ─────────────────────────────────────────────
+# CONCEPT: docker-compose
+# docker-compose.yml defines multiple services
+# that work together as one application.
+# Instead of starting Redis, PostgreSQL, and your
+# app separately, one command starts everything:
+#   docker-compose up
+#
+# Services talk to each other using service names
+# as hostnames. Your app connects to PostgreSQL
+# at host "db" and Redis at host "redis" —
+# Docker handles the networking automatically.
+# ─────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+
+  # ── PostgreSQL Database ──────────────────────
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: invoice_db
+    volumes:
+      # CONCEPT: Named volumes
+      # Data persists even when container stops.
+      # Without this, all data is lost on restart.
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ────────────────────────────────────
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── FastAPI App ──────────────────────────────
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Override DATABASE_URL to use Docker service name
+      # "db" is the service name above — Docker resolves it
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/invoice_db
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      # Mount pdfs folder so generated PDFs persist
+      - ./pdfs:/app/pdfs
+
+  # ── Celery Worker ────────────────────────────
+  worker:
+    build: .
+    command: celery -A celery_app worker --loglevel=info --pool=solo
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/invoice_db
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./pdfs:/app/pdfs
+
+volumes:
+  postgres_data:
