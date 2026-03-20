@@ -30,21 +30,18 @@ from auth_router import router as auth_router
 from jwt_dependency import get_current_user
 from tasks import generate_pdf_task
 from logger import get_logger
+from ai_parser import parse_invoice_from_text
 
-# ─────────────────────────────────────────────
-# CONCEPT: Structured JSON Logging
-# Every log line is a JSON object — searchable,
-# parseable by tools like Datadog and CloudWatch.
-# logger.info() for normal events
-# logger.error() for failures
-# extra={} adds searchable fields to the log
-# ─────────────────────────────────────────────
 logger = get_logger(__name__)
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas as pdf_canvas
 
 limiter = Limiter(key_func=get_remote_address)
+
+
+class ParseTextRequest(BaseModel):
+    text: str
 
 
 @asynccontextmanager
@@ -100,7 +97,7 @@ def create_product(request: Request, product: ProductCreate):
     )
     conn.commit()
     conn.close()
-    logger.info("Product created", extra={"name": product.name, "price": product.current_price})
+    logger.info("Product created", extra={"product_name": product.name, "price": product.current_price})
     return {"message": "Product created successfully"}
 
 
@@ -268,6 +265,36 @@ def download_invoice_pdf(request: Request, invoice_id: int):
         )
     finally:
         conn.close()
+
+
+@app.post("/invoices/parse-text", dependencies=[Depends(verify_api_key)])
+@limiter.limit("10/minute")
+def parse_invoice_text(request: Request, body: ParseTextRequest):
+    text = body.text
+    if not text:
+        raise HTTPException(status_code=400, detail="text field is required")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, current_price, stock_quantity FROM products")
+    products = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    if not products:
+        raise HTTPException(status_code=400, detail="No products available. Add products first.")
+
+    parsed = parse_invoice_from_text(text, products)
+
+    if "error" in parsed:
+        raise HTTPException(status_code=422, detail=parsed["error"])
+
+    logger.info("Invoice parsed from text", extra={"input_text": text})
+
+    return {
+        "message": "Text parsed successfully",
+        "parsed_data": parsed,
+        "hint": "Use this data to POST to /invoices to create the invoice"
+    }
 
 
 def _draw_invoice_header(c, invoice, width, y):
